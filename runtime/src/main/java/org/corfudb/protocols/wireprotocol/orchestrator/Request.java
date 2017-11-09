@@ -18,7 +18,7 @@ public interface Request {
     OrchestratorRequestType getType();
 
     /**
-     * Serialize this request into a ByteBuf
+     * Serialize this request into a byte array
      * @return serialized bytes of the request
      */
     byte[] getSerialized();
