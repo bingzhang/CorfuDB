@@ -165,7 +165,7 @@ public class LayoutManagementView extends AbstractView {
             log.error("Bootstrapping sequencer failed due to exception : ", e);
         }
     }
-
+    
     /**
      * Attempts to merge the last 2 segments.
      *

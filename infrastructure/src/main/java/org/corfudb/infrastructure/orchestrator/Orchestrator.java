@@ -2,17 +2,29 @@ package org.corfudb.infrastructure.orchestrator;
 
 import io.netty.channel.ChannelHandlerContext;
 import lombok.extern.slf4j.Slf4j;
+import org.corfudb.format.Types;
 import org.corfudb.infrastructure.IServerRouter;
 import org.corfudb.protocols.wireprotocol.CorfuMsgType;
 import org.corfudb.protocols.wireprotocol.CorfuPayloadMsg;
+import org.corfudb.protocols.wireprotocol.orchestrator.AddNodeResponse;
 import org.corfudb.protocols.wireprotocol.orchestrator.OrchestratorRequest;
+import org.corfudb.protocols.wireprotocol.orchestrator.OrchestratorResponse;
+import org.corfudb.protocols.wireprotocol.orchestrator.QueryRequest;
+import org.corfudb.protocols.wireprotocol.orchestrator.QueryResponse;
+import org.corfudb.protocols.wireprotocol.orchestrator.Request;
+import org.corfudb.protocols.wireprotocol.orchestrator.Response;
 import org.corfudb.runtime.CorfuRuntime;
 import org.corfudb.runtime.view.Layout;
 
 import javax.annotation.Nonnull;
 import java.util.List;
+import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+
+import static org.corfudb.format.Types.OrchestratorRequestType.QUERY;
 
 /**
  * The orchestrator is a stateless service that runs on all management servers and its purpose
@@ -29,6 +41,7 @@ import java.util.concurrent.CompletableFuture;
 public class Orchestrator {
 
     final Callable<CorfuRuntime> getRuntime;
+    final Set<UUID> activeWorkflows = ConcurrentHashMap.newKeySet();
 
     public Orchestrator(@Nonnull Callable<CorfuRuntime> runtime) {
         this.getRuntime = runtime;
@@ -38,14 +51,38 @@ public class Orchestrator {
                        @Nonnull ChannelHandlerContext ctx,
                        @Nonnull IServerRouter r) {
 
-        OrchestratorRequest req = msg.getPayload();
-        dispatch(req);
-        r.sendResponse(ctx, msg, CorfuMsgType.ORCHESTRATOR_RESPONSE.msg());
+        OrchestratorRequest orchReq = msg.getPayload();
+
+        if (orchReq.getRequest().getType() == QUERY) {
+            handleQuery(msg, ctx, r);
+        } else {
+            dispatch(msg, ctx, r);
+        }
     }
 
-    void dispatch(@Nonnull OrchestratorRequest req) {
+    void handleQuery(CorfuPayloadMsg<OrchestratorRequest> msg, ChannelHandlerContext ctx, IServerRouter r) {
+        QueryRequest req = (QueryRequest) msg.getPayload().getRequest();
+
+        Response resp;
+        if (activeWorkflows.contains(req.getId())) {
+            resp = new QueryResponse(true);
+        } else {
+            resp = new QueryResponse(false);
+        }
+
+        r.sendResponse(ctx, msg, CorfuMsgType.ORCHESTRATOR_RESPONSE
+                .payloadMsg(new OrchestratorResponse(resp )));
+    }
+
+    void dispatch(CorfuPayloadMsg<OrchestratorRequest> msg, ChannelHandlerContext ctx, IServerRouter r) {
         CompletableFuture.runAsync(() -> {
-            run(getWorkflow(req));
+            OrchestratorRequest req = msg.getPayload();
+            Workflow workflow = getWorkflow(req);
+            activeWorkflows.add(workflow.getId());
+            OrchestratorResponse resp = new OrchestratorResponse(new AddNodeResponse(workflow.getId()));
+            r.sendResponse(ctx, msg, CorfuMsgType.ORCHESTRATOR_RESPONSE
+                    .payloadMsg(resp));
+            run(workflow);
         });
     }
 
@@ -56,7 +93,12 @@ public class Orchestrator {
      */
     @Nonnull
     private Workflow getWorkflow(@Nonnull OrchestratorRequest req) {
-        return null;
+        Request payload = req.getRequest();
+        if (payload.getType().equals(Types.OrchestratorRequestType.ADD_NODE)) {
+            return new AddNodeWorkflow(payload);
+        }
+
+        throw new IllegalArgumentException("Unknown request");
     }
 
     /**
@@ -69,7 +111,7 @@ public class Orchestrator {
 
         try {
             Layout currLayout =  getRuntime.call().layout.get();
-            String servers = String.join(",", currLayout.getAllServers());
+            String servers = String.join(",", currLayout.getLayoutServers());
             rt = new CorfuRuntime(servers)
                     .setCacheDisabled(true)
                     .setLoadSmrMapsAtConnect(false)
@@ -77,23 +119,19 @@ public class Orchestrator {
 
             log.info("run: Started workflow {} id {}", workflow.getName(), workflow.getId());
             long workflowStart = System.currentTimeMillis();
-
             for (Action action : workflow.getActions()) {
-                try {
-                    log.debug("run: Started action {} for workflow {}", action.getName(), workflow.getId());
-                    long actionStart = System.currentTimeMillis();
-                    action.execute(rt);
-                    long actionEnd = System.currentTimeMillis();
-                    log.debug("run: finished action {} for workflow {} in {} ms",
-                            action.getName(), workflow.getId(), actionEnd - actionStart);
 
-                    if (action.getStatus() == ActionStatus.COMPLETED) {
-                        throw new IllegalStateException("Action hasn't completed!");
-                    }
-                } catch (Exception e) {
+                log.debug("run: Started action {} for workflow {}", action.getName(), workflow.getId());
+                long actionStart = System.currentTimeMillis();
+                action.execute(rt);
+                long actionEnd = System.currentTimeMillis();
+                log.info("run: finished action {} for workflow {} in {} ms",
+                        action.getName(), workflow.getId(), actionEnd - actionStart);
+
+                if (action.getStatus() != ActionStatus.COMPLETED) {
                     log.error("run: Failed to execute action {} for workflow {}, status {}, ",
                             action.getName(), workflow.getId(),
-                            action.getStatus(), e);
+                            action.getStatus());
                     return;
                 }
             }
@@ -101,11 +139,14 @@ public class Orchestrator {
             long workflowEnd = System.currentTimeMillis();
             log.info("run: Completed workflow {} in {} ms", workflow.getId(), workflowEnd - workflowStart);
         } catch (Exception e) {
-            log.error("run: Encountered an error while running workflow {}", workflow.getName(), e);
+            log.error("run: Encountered an error while running workflow {}", workflow.getId(), e);
+            return;
         } finally {
             if (rt != null) {
                 rt.shutdown();
             }
+
+            activeWorkflows.remove(workflow.getId());
         }
     }
 }
