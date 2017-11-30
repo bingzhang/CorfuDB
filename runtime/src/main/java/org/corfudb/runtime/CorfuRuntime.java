@@ -31,13 +31,7 @@ import org.corfudb.runtime.clients.ManagementClient;
 import org.corfudb.runtime.clients.NettyClientRouter;
 import org.corfudb.runtime.clients.SequencerClient;
 import org.corfudb.runtime.exceptions.NetworkException;
-import org.corfudb.runtime.view.AddressSpaceView;
-import org.corfudb.runtime.view.Layout;
-import org.corfudb.runtime.view.LayoutManagementView;
-import org.corfudb.runtime.view.LayoutView;
-import org.corfudb.runtime.view.ObjectsView;
-import org.corfudb.runtime.view.SequencerView;
-import org.corfudb.runtime.view.StreamsView;
+import org.corfudb.runtime.view.*;
 
 import org.corfudb.util.GitRepositoryState;
 import org.corfudb.util.MetricsUtils;
@@ -101,6 +95,11 @@ public class CorfuRuntime {
      */
     @Getter(lazy = true)
     private final LayoutManagementView layoutManagementView = new LayoutManagementView(this);
+    /**
+     * A view of the Management Server.
+     */
+    @Getter(lazy = true)
+    private final ManagementView managementView = new ManagementView(this);
     /**
      * A list of known layout servers.
      */
