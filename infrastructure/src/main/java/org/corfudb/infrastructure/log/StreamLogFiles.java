@@ -1,13 +1,17 @@
 package org.corfudb.infrastructure.log;
 
+import com.esotericsoftware.kryo.io.ByteBufferInputStream;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.hash.Hasher;
 import com.google.common.hash.Hashing;
+import com.google.common.io.ByteStreams;
 import com.google.protobuf.AbstractMessage;
 import com.google.protobuf.ByteString;
+import com.google.protobuf.ExtensionRegistryLite;
 import com.google.protobuf.InvalidProtocolBufferException;
 
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufInputStream;
 import io.netty.buffer.Unpooled;
 
 import java.io.File;
@@ -16,10 +20,13 @@ import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
+import java.nio.MappedByteBuffer;
 import java.nio.channels.Channels;
 import java.nio.channels.FileChannel;
+import java.nio.channels.FileChannel.MapMode;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Paths;
@@ -60,6 +67,7 @@ import org.corfudb.protocols.wireprotocol.IMetadata;
 import org.corfudb.protocols.wireprotocol.LogData;
 import org.corfudb.runtime.exceptions.DataCorruptionException;
 import org.corfudb.runtime.exceptions.OverwriteException;
+import org.corfudb.util.AutoCleanableMappedBuffer;
 
 
 /**
@@ -611,7 +619,6 @@ public class StreamLogFiles implements StreamLog, StreamLogWithRankedAddressSpac
     private void readAddressSpace(SegmentHandle sh) throws IOException {
         long logFileSize;
 
-
         try (MultiReadWriteLock.AutoCloseableLock ignored =
                      segmentLocks.acquireReadLock(sh.getSegment())) {
             logFileSize = sh.logChannel.size();
@@ -624,61 +631,46 @@ public class StreamLogFiles implements StreamLog, StreamLogWithRankedAddressSpac
             return;
         }
 
-        // Skip the header
-        ByteBuffer headerMetadataBuf = ByteBuffer.allocate(METADATA_SIZE);
-        fc.read(headerMetadataBuf);
-        headerMetadataBuf.flip();
+        try (AutoCleanableMappedBuffer logBuf =
+            new AutoCleanableMappedBuffer(fc.map(MapMode.READ_ONLY, 0, logFileSize))) {
+            final ByteBuf buf = Unpooled.wrappedBuffer(logBuf.getBuffer());
 
-        Metadata headerMetadata = Metadata.parseFrom(headerMetadataBuf.array());
+            try (ByteBufInputStream bbis = new ByteBufInputStream(buf)) {
+                Metadata headerMetadata = Metadata
+                    .parseFrom(ByteStreams.limit(bbis, METADATA_SIZE));
+                bbis.skipBytes(headerMetadata.getLength());
 
-        fc.position(fc.position() + headerMetadata.getLength());
-        long channelOffset = fc.position();
-        ByteBuffer o = ByteBuffer.allocate((int) logFileSize - (int) fc.position());
-        fc.read(o);
-        fc.close();
-        o.flip();
+                while (bbis.available() > 0) {
+                    try {
+                        final short magic = bbis.readShort();
+                        if (magic != RECORD_DELIMITER) {
+                            log.error("Expected a delimiter but found something else while "
+                                + "trying to read file {}", sh.fileName);
+                            throw new DataCorruptionException();
+                        }
 
-        while (o.hasRemaining()) {
-
-            short magic = o.getShort();
-            channelOffset += Short.BYTES;
-
-            if (magic != RECORD_DELIMITER) {
-                log.error("Expected a delimiter but found something else while "
-                        + "trying to read file {}", sh.fileName);
-                throw new DataCorruptionException();
-            }
-
-            byte[] metadataBuf = new byte[METADATA_SIZE];
-            o.get(metadataBuf);
-            channelOffset += METADATA_SIZE;
-
-            try {
-                Metadata metadata = Metadata.parseFrom(metadataBuf);
-
-                byte[] logEntryBuf = new byte[metadata.getLength()];
-
-                o.get(logEntryBuf);
-
-                LogEntry entry = LogEntry.parseFrom(logEntryBuf);
-
-                if (!noVerify) {
-                    if (metadata.getChecksum() != getChecksum(entry.toByteArray())) {
-                        log.error("Checksum mismatch detected while trying to read file {}",
-                                sh.fileName);
+                        Metadata metadata = Metadata
+                            .parseFrom(ByteStreams.limit(bbis, METADATA_SIZE));
+                        int index = buf.readerIndex();
+                        LogEntry entry = LogEntry.parseFrom(ByteStreams.limit(bbis,
+                            metadata.getLength()));
+                        if (!noVerify) {
+                            if (metadata.getChecksum() != getChecksum(entry.toByteArray())) {
+                                log.error("Checksum mismatch detected while trying to read file {}",
+                                    sh.fileName);
+                                throw new DataCorruptionException();
+                            }
+                        }
+                        sh.knownAddresses.put(entry.getGlobalAddress(),
+                            new AddressMetaData(metadata.getChecksum(),
+                                metadata.getLength(), index));
+                    } catch (InvalidProtocolBufferException e) {
                         throw new DataCorruptionException();
                     }
                 }
-
-                sh.knownAddresses.put(entry.getGlobalAddress(),
-                        new AddressMetaData(metadata.getChecksum(),
-                                metadata.getLength(), channelOffset));
-
-                channelOffset += metadata.getLength();
-
-            } catch (InvalidProtocolBufferException e) {
-                throw new DataCorruptionException();
             }
+        } finally {
+            fc.close();
         }
     }
 
@@ -691,23 +683,24 @@ public class StreamLogFiles implements StreamLog, StreamLogWithRankedAddressSpac
      */
     private LogData  readRecord(SegmentHandle sh, long address)
             throws IOException {
-        FileChannel fc = null;
+        FileChannel fc = getChannel(sh.fileName, true);
         try {
-            fc = getChannel(sh.fileName, true);
             AddressMetaData metaData = sh.getKnownAddresses().get(address);
             if (metaData == null) {
                 return null;
             }
 
-            fc.position(metaData.offset);
-
-            try {
-                ByteBuffer entryBuf = ByteBuffer.allocate(metaData.length);
-                fc.read(entryBuf);
-                return getLogData(LogEntry.parseFrom(entryBuf.array()));
-            } catch (InvalidProtocolBufferException e) {
-                throw new DataCorruptionException();
+            try (AutoCleanableMappedBuffer logBuf =
+                    new AutoCleanableMappedBuffer(
+                        fc.map(MapMode.READ_ONLY, metaData.offset, metaData.length))) {
+                try (ByteBufInputStream bbis = new ByteBufInputStream(
+                                            Unpooled.wrappedBuffer(logBuf.getBuffer()))) {
+                    return getLogData(LogEntry.parseFrom(ByteStreams.limit(bbis, metaData.length)));
+                }
             }
+
+        } catch (InvalidProtocolBufferException e) {
+            throw new DataCorruptionException();
         } finally {
             if (fc != null) {
                 fc.close();
