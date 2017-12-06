@@ -7,7 +7,6 @@ import com.google.common.hash.Hashing;
 import com.google.common.io.ByteStreams;
 import com.google.protobuf.AbstractMessage;
 import com.google.protobuf.ByteString;
-import com.google.protobuf.ExtensionRegistryLite;
 import com.google.protobuf.InvalidProtocolBufferException;
 
 import io.netty.buffer.ByteBuf;
@@ -20,10 +19,8 @@ import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
-import java.nio.MappedByteBuffer;
 import java.nio.channels.Channels;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileChannel.MapMode;
@@ -39,15 +36,12 @@ import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executor;
-import java.util.concurrent.atomic.AtomicLong;
 
 import java.util.concurrent.atomic.LongAccumulator;
 import javax.annotation.Nullable;
@@ -459,38 +453,49 @@ public class StreamLogFiles implements StreamLog, StreamLogWithRankedAddressSpac
     }
 
     private void trimLogFile(String filePath, Set<Long> pendingTrim) throws IOException {
-        try (FileChannel fc = FileChannel.open(FileSystems.getDefault().getPath(filePath + ".copy"),
+        try (FileChannel fc = FileChannel.open(
+                                        FileSystems.getDefault()
+                                                    .getPath(filePath + ".copy"),
                 EnumSet.of(StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE,
                         StandardOpenOption.CREATE, StandardOpenOption.SPARSE))) {
 
-            CompactedEntry log = getCompactedEntries(filePath, pendingTrim);
 
-            LogHeader header = log.getLogHeader();
-            Collection<LogEntry> compacted = log.getEntries();
-
-            writeHeader(fc, header.getVersion(), header.getVerifyChecksum());
-
-            for (LogEntry entry : compacted) {
-
-                ByteBuffer record = getByteBufferWithMetaData(entry);
-                ByteBuffer recordBuf = ByteBuffer.allocate(Short.BYTES // Delimiter
-                        + record.capacity());
-
-                recordBuf.putShort(RECORD_DELIMITER);
-                recordBuf.put(record.array());
-                recordBuf.flip();
-
-                fc.write(recordBuf);
+            FileChannel baseFc = getChannel(filePath, true);
+            if (baseFc == null) {
+                throw new IOException("Failed to open file to trim!");
             }
 
+            try (MappedByteBufInputStream stream = new MappedByteBufInputStream(baseFc)) {
+                Metadata headerMetadata = Metadata.parseFrom(stream.limited(METADATA_SIZE));
+                LogHeader header = LogHeader.parseFrom(stream.limited(headerMetadata.getLength()));
+                writeHeader(fc, header.getVersion(), header.getVerifyChecksum());
+
+                while (stream.available() > 0) {
+                    int position = stream.position();
+                    // Skip delimiter
+                    stream.readShort();
+                    Metadata logMetadata = Metadata.parseFrom(stream.limited(METADATA_SIZE));
+                    LogEntryMetadataOnly logEntry =
+                        LogEntryMetadataOnly.parseFrom(stream.limited(logMetadata.getLength()));
+                    if (!pendingTrim.contains(logEntry.getGlobalAddress())) {
+                        baseFc.transferTo(position,
+                            Short.BYTES             // Delimiter
+                                + METADATA_SIZE           // Metadata
+                                + logMetadata.getLength() // LogEntry
+                            , fc);
+                    }
+                }
+            } finally {
+                baseFc.close();
+            }
             fc.force(true);
+            fc.close();
         }
 
         try (FileChannel fc2 = FileChannel.open(FileSystems.getDefault()
                         .getPath(getTrimmedFilePath(filePath)),
                 EnumSet.of(StandardOpenOption.APPEND))) {
             try (OutputStream outputStream = Channels.newOutputStream(fc2)) {
-                // Todo(Maithem) How do we verify that the compacted file is correct?
                 for (Long address : pendingTrim) {
                     TrimEntry entry = TrimEntry.newBuilder()
                             .setChecksum(getChecksum(address))
@@ -503,6 +508,7 @@ public class StreamLogFiles implements StreamLog, StreamLogWithRankedAddressSpac
             }
         }
 
+        scanAndVerifyEntries(filePath + ".copy");
         Files.move(Paths.get(filePath + ".copy"), Paths.get(filePath),
                 StandardCopyOption.ATOMIC_MOVE);
 
@@ -537,47 +543,6 @@ public class StreamLogFiles implements StreamLog, StreamLogWithRankedAddressSpac
                     }
                     globalTail.accumulate(logEntry.getGlobalAddress());
                 }
-            }
-        }
-    }
-
-    private CompactedEntry getCompactedEntries(String filePath,
-                                               Set<Long> pendingTrim) throws IOException {
-
-        FileChannel fc = getChannel(filePath, true);
-        Map<Long, LogEntry> compactedEntryMap = new HashMap<>();
-
-        // Skip the header
-        try (AutoCleanableMappedBuffer logBuf = new AutoCleanableMappedBuffer(
-            fc.map(MapMode.READ_ONLY, 0, fc.size()))) {
-            try (ByteBufInputStream bbis = new ByteBufInputStream(
-                Unpooled.wrappedBuffer(logBuf.getBuffer()))) {
-                Metadata headerMetadata = Metadata
-                    .parseFrom(ByteStreams.limit(bbis, METADATA_SIZE));
-                LogHeader header = LogHeader.parseFrom(ByteStreams.limit(bbis,
-                    headerMetadata.getLength()));
-
-                while (bbis.available() > 0) {
-                    // Skip delimiter
-                    bbis.readShort();
-                    Metadata logMetadata = Metadata
-                        .parseFrom(ByteStreams.limit(bbis, METADATA_SIZE));
-                    LogEntry logEntry = LogEntry.parseFrom(ByteStreams.limit(bbis,
-                        logMetadata.getLength()));
-                    if (!noVerify) {
-                        if (logMetadata.getChecksum() != getChecksum(logEntry.toByteArray())) {
-                            log.error("Checksum mismatch detected while trying to read address {}",
-                                logEntry.getGlobalAddress());
-                            throw new DataCorruptionException();
-                        }
-                    }
-
-                    if (!pendingTrim.contains(logEntry.getGlobalAddress())) {
-                        compactedEntryMap.put(logEntry.getGlobalAddress(), logEntry);
-                    }
-                }
-
-                return new CompactedEntry(header, compactedEntryMap.values());
             }
         }
     }
@@ -639,42 +604,35 @@ public class StreamLogFiles implements StreamLog, StreamLogWithRankedAddressSpac
             return;
         }
 
-        try (AutoCleanableMappedBuffer logBuf =
-            new AutoCleanableMappedBuffer(fc.map(MapMode.READ_ONLY, 0, logFileSize))) {
-            final ByteBuf buf = Unpooled.wrappedBuffer(logBuf.getBuffer());
+        try (MappedByteBufInputStream stream = new MappedByteBufInputStream(fc, logFileSize)) {
+            Metadata headerMetadata = Metadata
+                .parseFrom(stream.limited(METADATA_SIZE));
+            stream.skipBytes(headerMetadata.getLength());
 
-            try (ByteBufInputStream bbis = new ByteBufInputStream(buf)) {
-                Metadata headerMetadata = Metadata
-                    .parseFrom(ByteStreams.limit(bbis, METADATA_SIZE));
-                bbis.skipBytes(headerMetadata.getLength());
-
-                while (bbis.available() > 0) {
-                    try {
-                        final short magic = bbis.readShort();
-                        if (magic != RECORD_DELIMITER) {
-                            log.error("Expected a delimiter but found something else while "
-                                + "trying to read file {}", sh.fileName);
-                            throw new DataCorruptionException();
-                        }
-
-                        Metadata metadata = Metadata
-                            .parseFrom(ByteStreams.limit(bbis, METADATA_SIZE));
-                        int index = buf.readerIndex();
-                        LogEntry entry = LogEntry.parseFrom(ByteStreams.limit(bbis,
-                            metadata.getLength()));
-                        if (!noVerify) {
-                            if (metadata.getChecksum() != getChecksum(entry.toByteArray())) {
-                                log.error("Checksum mismatch detected while trying to read file {}",
-                                    sh.fileName);
-                                throw new DataCorruptionException();
-                            }
-                        }
-                        sh.knownAddresses.put(entry.getGlobalAddress(),
-                            new AddressMetaData(metadata.getChecksum(),
-                                metadata.getLength(), index));
-                    } catch (InvalidProtocolBufferException e) {
+            while (stream.available() > 0) {
+                try {
+                    final short magic = stream.readShort();
+                    if (magic != RECORD_DELIMITER) {
+                        log.error("Expected a delimiter but found something else while "
+                            + "trying to read file {}", sh.fileName);
                         throw new DataCorruptionException();
                     }
+
+                    Metadata metadata = Metadata.parseFrom(stream.limited(METADATA_SIZE));
+                    int index = stream.position();
+                    LogEntry entry = LogEntry.parseFrom(stream.limited(metadata.getLength()));
+                    if (!noVerify) {
+                        if (metadata.getChecksum() != getChecksum(entry.toByteArray())) {
+                            log.error("Checksum mismatch detected while trying to read file {}",
+                                sh.fileName);
+                            throw new DataCorruptionException();
+                        }
+                    }
+                    sh.knownAddresses.put(entry.getGlobalAddress(),
+                        new AddressMetaData(metadata.getChecksum(),
+                            metadata.getLength(), index));
+                } catch (InvalidProtocolBufferException e) {
+                    throw new DataCorruptionException();
                 }
             }
         } finally {
@@ -692,27 +650,23 @@ public class StreamLogFiles implements StreamLog, StreamLogWithRankedAddressSpac
     private LogData  readRecord(SegmentHandle sh, long address)
             throws IOException {
         FileChannel fc = getChannel(sh.fileName, true);
+        if (fc == null) {
+            throw new IllegalStateException("File channel could not be opened");
+        }
+
         try {
             AddressMetaData metaData = sh.getKnownAddresses().get(address);
             if (metaData == null) {
                 return null;
             }
-
-            try (AutoCleanableMappedBuffer logBuf =
-                    new AutoCleanableMappedBuffer(
-                        fc.map(MapMode.READ_ONLY, metaData.offset, metaData.length))) {
-                try (ByteBufInputStream bbis = new ByteBufInputStream(
-                                            Unpooled.wrappedBuffer(logBuf.getBuffer()))) {
-                    return getLogData(LogEntry.parseFrom(ByteStreams.limit(bbis, metaData.length)));
-                }
+            try (MappedByteBufInputStream stream =
+                new MappedByteBufInputStream(fc, metaData.offset, metaData.length)) {
+                    return getLogData(LogEntry.parseFrom(stream.limited(metaData.length)));
             }
-
         } catch (InvalidProtocolBufferException e) {
             throw new DataCorruptionException();
         } finally {
-            if (fc != null) {
-                fc.close();
-            }
+            fc.close();
         }
     }
 
@@ -1199,24 +1153,6 @@ public class StreamLogFiles implements StreamLog, StreamLogWithRankedAddressSpac
     @VisibleForTesting
     Collection<SegmentHandle> getSegmentHandles() {
         return writeChannels.values();
-    }
-
-    public static class CompactedEntry {
-        private final LogHeader logHeader;
-        private final Collection<LogEntry> entries;
-
-        public CompactedEntry(LogHeader logHeader, Collection<LogEntry> entries) {
-            this.logHeader = logHeader;
-            this.entries = entries;
-        }
-
-        public LogHeader getLogHeader() {
-            return logHeader;
-        }
-
-        public Collection<LogEntry> getEntries() {
-            return entries;
-        }
     }
 
     /**
