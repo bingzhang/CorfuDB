@@ -518,60 +518,41 @@ public class StreamLogFiles implements StreamLog, StreamLogWithRankedAddressSpac
                                                Set<Long> pendingTrim) throws IOException {
 
         FileChannel fc = getChannel(filePath, true);
+        Map<Long, LogEntry> compactedEntryMap = new HashMap<>();
 
         // Skip the header
-        ByteBuffer headerMetadataBuf = ByteBuffer.allocate(METADATA_SIZE);
-        fc.read(headerMetadataBuf);
-        headerMetadataBuf.flip();
+        try (AutoCleanableMappedBuffer logBuf = new AutoCleanableMappedBuffer(
+            fc.map(MapMode.READ_ONLY, 0, fc.size()))) {
+            try (ByteBufInputStream bbis = new ByteBufInputStream(
+                Unpooled.wrappedBuffer(logBuf.getBuffer()))) {
+                Metadata headerMetadata = Metadata
+                    .parseFrom(ByteStreams.limit(bbis, METADATA_SIZE));
+                LogHeader header = LogHeader.parseFrom(ByteStreams.limit(bbis,
+                    headerMetadata.getLength()));
 
-        Metadata headerMetadata = Metadata.parseFrom(headerMetadataBuf.array());
-        ByteBuffer headerBuf = ByteBuffer.allocate(headerMetadata.getLength());
-        fc.read(headerBuf);
-        headerBuf.flip();
+                while (bbis.available() > 0) {
+                    // Skip delimiter
+                    bbis.readShort();
+                    Metadata logMetadata = Metadata
+                        .parseFrom(ByteStreams.limit(bbis, METADATA_SIZE));
+                    LogEntry logEntry = LogEntry.parseFrom(ByteStreams.limit(bbis,
+                        logMetadata.getLength()));
+                    if (!noVerify) {
+                        if (logMetadata.getChecksum() != getChecksum(logEntry.toByteArray())) {
+                            log.error("Checksum mismatch detected while trying to read address {}",
+                                logEntry.getGlobalAddress());
+                            throw new DataCorruptionException();
+                        }
+                    }
 
-        ByteBuffer o = ByteBuffer.allocate((int) fc.size() - (int) fc.position());
-        fc.read(o);
-        fc.close();
-        o.flip();
-
-        LinkedHashMap<Long, LogEntry> compacted = new LinkedHashMap<>();
-
-        while (o.hasRemaining()) {
-
-            //Skip delimiter
-            o.getShort();
-
-            byte[] metadataBuf = new byte[METADATA_SIZE];
-            o.get(metadataBuf);
-
-            try {
-                Metadata metadata = Metadata.parseFrom(metadataBuf);
-
-                byte[] logEntryBuf = new byte[metadata.getLength()];
-
-                o.get(logEntryBuf);
-
-                LogEntry entry = LogEntry.parseFrom(logEntryBuf);
-
-                if (!noVerify) {
-                    if (metadata.getChecksum() != getChecksum(entry.toByteArray())) {
-                        log.error("Checksum mismatch detected while trying to read address {}",
-                                    entry.getGlobalAddress());
-                        throw new DataCorruptionException();
+                    if (!pendingTrim.contains(logEntry.getGlobalAddress())) {
+                        compactedEntryMap.put(logEntry.getGlobalAddress(), logEntry);
                     }
                 }
 
-                if (!pendingTrim.contains(entry.getGlobalAddress())) {
-                    compacted.put(entry.getGlobalAddress(), entry);
-                }
-
-            } catch (InvalidProtocolBufferException e) {
-                throw new DataCorruptionException();
+                return new CompactedEntry(header, compactedEntryMap.values());
             }
         }
-
-        LogHeader header = LogHeader.parseFrom(headerBuf.array());
-        return new CompactedEntry(header, compacted.values());
     }
 
     private LogData getLogData(LogEntry entry) {
