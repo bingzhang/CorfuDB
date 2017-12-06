@@ -520,7 +520,7 @@ public class StreamLogFilesTest extends AbstractCorfuTest {
     public void testGetGlobalTail() {
         StreamLogFiles log = new StreamLogFiles(getContext(), false);
 
-        assertThat(log.getGlobalTail()).isEqualTo(0);
+        assertThat(log.getGlobalTail()).isEqualTo(-1L);
 
         // Write to multiple segments
         final int segments = 3;

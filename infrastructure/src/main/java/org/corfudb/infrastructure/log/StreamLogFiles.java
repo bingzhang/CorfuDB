@@ -49,6 +49,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicLong;
 
+import java.util.concurrent.atomic.LongAccumulator;
 import javax.annotation.Nullable;
 
 import lombok.Data;
@@ -58,6 +59,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.io.FileUtils;
 import org.corfudb.format.Types;
 import org.corfudb.format.Types.LogEntry;
+import org.corfudb.format.Types.LogEntryMetadataOnly;
 import org.corfudb.format.Types.LogHeader;
 import org.corfudb.format.Types.Metadata;
 import org.corfudb.format.Types.TrimEntry;
@@ -68,6 +70,7 @@ import org.corfudb.protocols.wireprotocol.LogData;
 import org.corfudb.runtime.exceptions.DataCorruptionException;
 import org.corfudb.runtime.exceptions.OverwriteException;
 import org.corfudb.util.AutoCleanableMappedBuffer;
+import org.corfudb.util.MappedByteBufInputStream;
 
 
 /**
@@ -93,7 +96,7 @@ public class StreamLogFiles implements StreamLog, StreamLogWithRankedAddressSpac
     public final String logDir;
     private final boolean noVerify;
     private final ServerContext serverContext;
-    private final AtomicLong globalTail = new AtomicLong(0L);
+    private final LongAccumulator globalTail = new LongAccumulator(Long::max, -1L);
     private Map<String, SegmentHandle> writeChannels;
     private Set<FileChannel> channelsToSync;
     private MultiReadWriteLock segmentLocks = new MultiReadWriteLock();
@@ -214,7 +217,7 @@ public class StreamLogFiles implements StreamLog, StreamLogWithRankedAddressSpac
         // TODO(Maithem) since writing a record and setting the tail segment is not
         // an atomic operation, it is possible to set an incorrect tail segment. In
         // that case we will need to scan more than one segment
-        globalTail.getAndUpdate(maxTail -> address > maxTail ? address : maxTail);
+        globalTail.accumulate(address);
         long segment = address / RECORDS_PER_LOG_FILE;
         if (lastSegment < segment) {
             serverContext.setTailSegment(segment);
@@ -255,14 +258,7 @@ public class StreamLogFiles implements StreamLog, StreamLogWithRankedAddressSpac
         long addressInTailSegment = (tailSegment * RECORDS_PER_LOG_FILE) + 1;
         SegmentHandle sh = getSegmentHandleForAddress(addressInTailSegment);
         try {
-            Collection<LogEntry> segmentEntries = (Collection<LogEntry>)
-                    getCompactedEntries(sh.getFileName(), new HashSet()).getEntries();
-
-            for (LogEntry entry : segmentEntries) {
-                long currentAddress = entry.getGlobalAddress();
-                globalTail.getAndUpdate(maxTail -> currentAddress > maxTail
-                        ? currentAddress : maxTail);
-            }
+            scanAndVerifyEntries(sh.fileName);
         } catch (IOException e) {
             throw new RuntimeException(e.getMessage(), e);
         } finally {
@@ -512,6 +508,37 @@ public class StreamLogFiles implements StreamLog, StreamLogWithRankedAddressSpac
 
         // Force the reload of the new segment
         writeChannels.remove(filePath);
+    }
+
+    /** Scan all entries, updating the LogUnit structures and verifying the log file integrity.
+     *
+     * @param filePath  The log file (segment) to scan
+     */
+    private void scanAndVerifyEntries(String filePath) throws IOException {
+        FileChannel fc = getChannel(filePath, true);
+        try (MappedByteBufInputStream stream = new MappedByteBufInputStream(fc)) {
+            Metadata headerMetadata = Metadata.parseFrom(stream.limited(METADATA_SIZE));
+            LogHeader header = LogHeader.parseFrom(stream.limited(headerMetadata.getLength()));
+
+            while (stream.available() > 0) {
+                // Skip delimiter
+                stream.readShort();
+                Metadata logMetadata = Metadata.parseFrom(stream.limited(METADATA_SIZE));
+                if (noVerify) {
+                    LogEntryMetadataOnly logEntry =
+                        LogEntryMetadataOnly.parseFrom(stream.limited(logMetadata.getLength()));
+                    globalTail.accumulate(logEntry.getGlobalAddress());
+                } else {
+                    LogEntry logEntry = LogEntry.parseFrom(stream.limited(logMetadata.getLength()));
+                    if (logMetadata.getChecksum() != getChecksum(logEntry.toByteArray())) {
+                        log.error("Checksum mismatch detected while trying to read address {}",
+                            logEntry.getGlobalAddress());
+                        throw new DataCorruptionException();
+                    }
+                    globalTail.accumulate(logEntry.getGlobalAddress());
+                }
+            }
+        }
     }
 
     private CompactedEntry getCompactedEntries(String filePath,
