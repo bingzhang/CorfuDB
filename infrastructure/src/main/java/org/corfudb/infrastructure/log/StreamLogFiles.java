@@ -1,16 +1,13 @@
 package org.corfudb.infrastructure.log;
 
-import com.esotericsoftware.kryo.io.ByteBufferInputStream;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.hash.Hasher;
 import com.google.common.hash.Hashing;
-import com.google.common.io.ByteStreams;
 import com.google.protobuf.AbstractMessage;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.InvalidProtocolBufferException;
 
 import io.netty.buffer.ByteBuf;
-import io.netty.buffer.ByteBufInputStream;
 import io.netty.buffer.Unpooled;
 
 import java.io.File;
@@ -23,7 +20,6 @@ import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
 import java.nio.channels.FileChannel;
-import java.nio.channels.FileChannel.MapMode;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Paths;
@@ -63,7 +59,6 @@ import org.corfudb.protocols.wireprotocol.IMetadata;
 import org.corfudb.protocols.wireprotocol.LogData;
 import org.corfudb.runtime.exceptions.DataCorruptionException;
 import org.corfudb.runtime.exceptions.OverwriteException;
-import org.corfudb.util.AutoCleanableMappedBuffer;
 import org.corfudb.util.MappedByteBufInputStream;
 
 
@@ -114,7 +109,7 @@ public class StreamLogFiles implements StreamLog, StreamLogWithRankedAddressSpac
         channelsToSync = new HashSet<>();
         this.noVerify = noVerify;
         this.serverContext = serverContext;
-        verifyLogs();
+
         // Starting address initialization should happen before
         // initializing the tail segment (i.e. initializeMaxGlobalAddress)
         initializeStartingAddress();
@@ -262,58 +257,6 @@ public class StreamLogFiles implements StreamLog, StreamLogWithRankedAddressSpac
         lastSegment = tailSegment;
     }
 
-    private void verifyLogs() {
-        String[] extension = {"log"};
-        File dir = new File(logDir);
-
-        if (dir.exists()) {
-            Collection<File> files = FileUtils.listFiles(dir, extension, true);
-
-            for (File file : files) {
-                try (FileInputStream fsIn = new FileInputStream(file)) {
-                    FileChannel fc = fsIn.getChannel();
-
-
-                    ByteBuffer metadataBuf = ByteBuffer.allocate(METADATA_SIZE);
-                    fc.read(metadataBuf);
-                    metadataBuf.flip();
-
-                    Metadata metadata = Metadata.parseFrom(metadataBuf.array());
-
-                    ByteBuffer headerBuf = ByteBuffer.allocate(metadata.getLength());
-                    fc.read(headerBuf);
-                    headerBuf.flip();
-
-                    LogHeader header = LogHeader.parseFrom(headerBuf.array());
-
-                    fc.close();
-                    fsIn.close();
-
-                    if (metadata.getChecksum() != getChecksum(header.toByteArray())) {
-                        log.error("Checksum mismatch detected while trying to read "
-                                + "header for logfile {}", file);
-                        throw new DataCorruptionException();
-                    }
-
-                    if (header.getVersion() != VERSION) {
-                        String msg = String.format("Log version {} for {} should match "
-                                + "the logunit log version {}",
-                                header.getVersion(), file.getAbsoluteFile(), VERSION);
-                        throw new RuntimeException(msg);
-                    }
-
-                    if (!noVerify && !header.getVerifyChecksum()) {
-                        String msg = String.format("Log file {} not generated with "
-                                + "checksums, can't verify!", file.getAbsoluteFile());
-                        throw new RuntimeException(msg);
-                    }
-
-                } catch (IOException e) {
-                    throw new RuntimeException(e.getMessage(), e);
-                }
-            }
-        }
-    }
 
     @Override
     public void sync(boolean force) throws IOException {
@@ -525,6 +468,27 @@ public class StreamLogFiles implements StreamLog, StreamLogWithRankedAddressSpac
         try (MappedByteBufInputStream stream = new MappedByteBufInputStream(fc)) {
             Metadata headerMetadata = Metadata.parseFrom(stream.limited(METADATA_SIZE));
             LogHeader header = LogHeader.parseFrom(stream.limited(headerMetadata.getLength()));
+
+            if (!noVerify) {
+                if (!header.getVerifyChecksum()) {
+                    String msg = String.format("Log file {} not generated with "
+                        + "checksums, can't verify!", filePath);
+                    throw new RuntimeException(msg);
+                }
+
+                if (headerMetadata.getChecksum() != getChecksum(header.toByteArray())) {
+                    log.error("Checksum mismatch detected while trying to read "
+                        + "header for logfile {}", filePath);
+                    throw new DataCorruptionException();
+                }
+
+                if (header.getVersion() != VERSION) {
+                    String msg = String.format("Log version {} for {} should match "
+                            + "the logunit log version {}",
+                        header.getVersion(), filePath, VERSION);
+                    throw new RuntimeException(msg);
+                }
+            }
 
             while (stream.available() > 0) {
                 // Skip delimiter
