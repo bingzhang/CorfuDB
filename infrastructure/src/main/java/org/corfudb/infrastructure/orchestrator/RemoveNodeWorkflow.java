@@ -4,6 +4,7 @@ import lombok.Getter;
 import org.corfudb.protocols.wireprotocol.orchestrator.RemoveNodeRequest;
 import org.corfudb.protocols.wireprotocol.orchestrator.Request;
 import org.corfudb.runtime.CorfuRuntime;
+import org.corfudb.runtime.view.Layout;
 
 import javax.annotation.Nonnull;
 import java.util.Arrays;
@@ -46,8 +47,9 @@ public class RemoveNodeWorkflow extends Workflow {
         @Override
         public void impl(@Nonnull CorfuRuntime runtime) throws Exception {
             changeStatus(ActionStatus.STARTED);
-            //runtime.getLayoutManagementView().removeNode(runtime.getLayoutView().getCurrentLayout(),
-              //      request.getEndpoint());
+            Layout layout = (Layout) runtime.getLayoutView().getLayout().clone();
+            runtime.getLayoutManagementView().removeNode(layout,
+                    request.getEndpoint());
             changeStatus(ActionStatus.COMPLETED);
         }
     }

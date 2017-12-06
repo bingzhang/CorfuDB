@@ -118,6 +118,7 @@ public class LayoutManagementView extends AbstractView {
     public void removeNode(Layout currentLayout, String endpoint) throws QuorumUnreachableException,
             CloneNotSupportedException,
             LayoutModificationException, OutrankedException {
+
         currentLayout.setRuntime(runtime);
         sealEpoch(currentLayout);
 
@@ -129,6 +130,7 @@ public class LayoutManagementView extends AbstractView {
                 .build();
 
         newLayout.setRuntime(runtime);
+
         attemptConsensus(newLayout);
 
         try {
