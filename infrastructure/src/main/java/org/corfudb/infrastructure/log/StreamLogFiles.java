@@ -529,6 +529,8 @@ public class StreamLogFiles implements StreamLog, StreamLogWithRankedAddressSpac
             }
         } catch (InvalidProtocolBufferException e) {
             throw new DataCorruptionException();
+        } finally {
+            fc.close();
         }
     }
 
