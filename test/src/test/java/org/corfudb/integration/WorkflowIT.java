@@ -20,7 +20,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * Created by Maithem on 12/1/17.
  */
 @Slf4j
-public class AddNodeIT extends AbstractIT {
+public class WorkflowIT extends AbstractIT {
 
     final String host = "localhost";
 
@@ -33,7 +33,7 @@ public class AddNodeIT extends AbstractIT {
     }
 
     @Test
-    public void AddNodeTest() throws Exception {
+    public void AddRemoveNodeTest() throws Exception {
         final String host = "localhost";
         final String streamName = "s1";
         final int n1Port = 9000;
@@ -101,6 +101,11 @@ public class AddNodeIT extends AbstractIT {
         assertThat(resp2.getWorkflowId()).isNotNull();
 
         waitForWorkflow(resp2.getWorkflowId(), n1Rt, n1Port);
+
+        // Remove node 2
+        mgmt.removeNode(getConnectionString(n2Port));
+        n1Rt.invalidateLayout();
+        assertThat(n1Rt.getLayoutView().getLayout().getAllServers().size()).isEqualTo(clusterSizeN2);
 
         // Verify that the third node has been added and data can be read back
         n1Rt.invalidateLayout();

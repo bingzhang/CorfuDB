@@ -11,20 +11,18 @@ import org.corfudb.protocols.wireprotocol.orchestrator.OrchestratorRequest;
 import org.corfudb.protocols.wireprotocol.orchestrator.OrchestratorResponse;
 import org.corfudb.protocols.wireprotocol.orchestrator.QueryRequest;
 import org.corfudb.protocols.wireprotocol.orchestrator.QueryResponse;
+import org.corfudb.protocols.wireprotocol.orchestrator.RemoveNodeResponse;
 import org.corfudb.protocols.wireprotocol.orchestrator.Request;
 import org.corfudb.protocols.wireprotocol.orchestrator.Response;
 import org.corfudb.runtime.CorfuRuntime;
 import org.corfudb.runtime.view.Layout;
 
 import javax.annotation.Nonnull;
-import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-
-import static org.corfudb.format.Types.OrchestratorRequestType.QUERY;
 
 /**
  * The orchestrator is a stateless service that runs on all management servers and its purpose
@@ -53,14 +51,22 @@ public class Orchestrator {
 
         OrchestratorRequest orchReq = msg.getPayload();
 
-        if (orchReq.getRequest().getType() == QUERY) {
-            handleQuery(msg, ctx, r);
-        } else {
-            dispatch(msg, ctx, r);
+        switch (orchReq.getRequest().getType()) {
+            case QUERY:
+                query(msg, ctx, r);
+                break;
+            case ADD_NODE:
+                dispatch(msg, ctx, r);
+                break;
+            case REMOVE_NODE:
+                removeNode(msg, ctx, r);
+                break;
+            default:
+                log.error("handle: Unknown request type {}", orchReq.getRequest().getType());
         }
     }
 
-    void handleQuery(CorfuPayloadMsg<OrchestratorRequest> msg, ChannelHandlerContext ctx, IServerRouter r) {
+    void query(CorfuPayloadMsg<OrchestratorRequest> msg, ChannelHandlerContext ctx, IServerRouter r) {
         QueryRequest req = (QueryRequest) msg.getPayload().getRequest();
 
         Response resp;
@@ -72,6 +78,18 @@ public class Orchestrator {
 
         r.sendResponse(ctx, msg, CorfuMsgType.ORCHESTRATOR_RESPONSE
                 .payloadMsg(new OrchestratorResponse(resp )));
+    }
+
+    void removeNode(CorfuPayloadMsg<OrchestratorRequest> msg, ChannelHandlerContext ctx, IServerRouter r) {
+        Workflow workflow = getWorkflow(msg.getPayload());
+        run(workflow);
+        boolean completed = false;
+        if (workflow.completed()) {
+            completed = true;
+        }
+        OrchestratorResponse resp = new OrchestratorResponse(new RemoveNodeResponse(completed));
+        r.sendResponse(ctx, msg, CorfuMsgType.ORCHESTRATOR_RESPONSE
+                .payloadMsg(resp));
     }
 
     void dispatch(CorfuPayloadMsg<OrchestratorRequest> msg, ChannelHandlerContext ctx, IServerRouter r) {
@@ -96,6 +114,8 @@ public class Orchestrator {
         Request payload = req.getRequest();
         if (payload.getType().equals(Types.OrchestratorRequestType.ADD_NODE)) {
             return new AddNodeWorkflow(payload);
+        } else if (payload.getType().equals(Types.OrchestratorRequestType.REMOVE_NODE)) {
+            return new RemoveNodeWorkflow(payload);
         }
 
         throw new IllegalArgumentException("Unknown request");
@@ -119,6 +139,7 @@ public class Orchestrator {
 
             log.info("run: Started workflow {} id {}", workflow.getName(), workflow.getId());
             long workflowStart = System.currentTimeMillis();
+            activeWorkflows.add(workflow.getId());
             for (Action action : workflow.getActions()) {
 
                 log.debug("run: Started action {} for workflow {}", action.getName(), workflow.getId());
@@ -145,7 +166,6 @@ public class Orchestrator {
             if (rt != null) {
                 rt.shutdown();
             }
-
             activeWorkflows.remove(workflow.getId());
         }
     }

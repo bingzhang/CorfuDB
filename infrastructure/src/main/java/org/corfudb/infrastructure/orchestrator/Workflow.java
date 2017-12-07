@@ -12,24 +12,37 @@ import java.util.UUID;
  * Created by Maithem on 10/25/17.
  */
 
-public interface Workflow {
+public abstract class Workflow {
 
     /**
      * Gets the unique identifier of this workflow instance
      * @return id of a particular instance
      */
-    UUID getId();
+    public abstract UUID getId();
 
     /**
      * Return the name of this workflow
      * @return workflow's name
      */
-    String getName();
+    public abstract String getName();
 
     /**
      * Returns the ordered that are associated with
      * this workflow.
      * @return List of actions
      */
-    List<Action> getActions();
+    public abstract List<Action> getActions();
+
+    /**
+     * Returns whether all the actions completed successfully or not.
+     * @return true if all actions completed successfully
+     */
+    public boolean completed() {
+        for (Action action : getActions()) {
+            if (action.getStatus() != ActionStatus.COMPLETED) {
+                return false;
+            }
+        }
+        return true;
+    }
 }

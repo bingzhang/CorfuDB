@@ -111,6 +111,34 @@ public class LayoutManagementView extends AbstractView {
     }
 
     /**
+     * Removes a node from the layout
+     * @param currentLayout the layout to remove the node from
+     * @param endpoint the node to remove
+     */
+    public void removeNode(Layout currentLayout, String endpoint) throws QuorumUnreachableException,
+            CloneNotSupportedException,
+            LayoutModificationException, OutrankedException {
+        currentLayout.setRuntime(runtime);
+        sealEpoch(currentLayout);
+
+        LayoutBuilder builder = new LayoutBuilder(currentLayout);
+        Layout newLayout = builder.removeLayoutServer(endpoint)
+                .removeSequencerServer(endpoint)
+                .removeLogunitServer(endpoint)
+                .removeUnResponsiveServer(endpoint)
+                .build();
+
+        newLayout.setRuntime(runtime);
+        attemptConsensus(newLayout);
+
+        try {
+            reconfigureSequencerServers(currentLayout, newLayout, true);
+        } catch (InterruptedException | ExecutionException e) {
+            log.error("mergeSegments: Bootstrapping sequencer failed due to exception : ", e);
+        }
+    }
+
+    /**
      * Adds a new node to the existing layout.
      *
      * @param currentLayout        Current layout.

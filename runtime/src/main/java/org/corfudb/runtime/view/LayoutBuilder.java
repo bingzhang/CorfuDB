@@ -72,6 +72,11 @@ public class LayoutBuilder {
         return this;
     }
 
+    public LayoutBuilder removeUnResponsiveServer(String endpoint) {
+        layout.getUnresponsiveServers().remove(endpoint);
+        return this;
+    }
+
 
     /**
      * Removes the Layout Server passed
@@ -327,32 +332,37 @@ public class LayoutBuilder {
      * Removes the logunit endpoint from the layout.
      *
      * @param endpoint Log unit server to be removed
-     * @return Workflow manager
+     * @return Builder
      * @throws LayoutModificationException Cannot remove non-replicated logunit
      */
     public LayoutBuilder removeLogunitServer(String endpoint)
-            throws LayoutModificationException {
+            throws LayoutModificationException , CloneNotSupportedException{
 
-        List<LayoutSegment> layoutSegments = layout.getSegments();
+        Layout tempLayout = (Layout) layout.clone();
+
+        List<LayoutSegment> layoutSegments = tempLayout.getSegments();
         for (LayoutSegment layoutSegment : layoutSegments) {
             for (LayoutStripe layoutStripe : layoutSegment.getStripes()) {
-
-                List<String> loguintServers = layoutStripe.getLogServers();
-
-                for (int k = 0; k < loguintServers.size(); k++) {
-                    if (loguintServers.get(k).equals(endpoint)) {
-                        if (loguintServers.size() == 1) {
-                            throw new LayoutModificationException(
-                                    "Attempting to remove all logunit. No replicas available.");
+                if(layoutStripe.getLogServers().remove(endpoint)) {
+                    if (layoutStripe.getLogServers().isEmpty()) {
+                        throw new LayoutModificationException(
+                                "Attempting to remove all logunit in stripe. "
+                                        + "No replicas available.");
+                    } else {
+                        if (layoutSegment.getReplicationMode() == Layout.ReplicationMode.CHAIN_REPLICATION) {
+                            if (layoutStripe.getLogServers().size() < 2) {
+                                throw new LayoutModificationException(
+                                        "Losing redundancy!");
+                            }
+                        } else if (layoutSegment.getReplicationMode() == Layout.ReplicationMode.QUORUM_REPLICATION) {
+                            throw new IllegalStateException("Unsupported operation!");
                         }
-                        loguintServers.remove(k);
-                        return this;
                     }
                 }
-
             }
         }
 
+        layout = tempLayout;
         return this;
     }
 

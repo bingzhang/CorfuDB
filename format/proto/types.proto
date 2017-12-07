@@ -20,6 +20,8 @@ enum OrchestratorRequestType {
     QUERY = 0;
     // Add a new node to the cluster
     ADD_NODE = 1;
+    // Remove node from the cluster
+    REMOVE_NODE = 2;
 }
 
 // Orchestrator responses
@@ -28,6 +30,8 @@ enum OrchestratorResponseType {
     WORKFLOW_STATUS = 0;
     // Id of a created workflow
     WORKFLOW_ID = 1;
+    // The status of a delete node operation
+    DELETE_STATUS = 2;
 }
 
 message DataRank {

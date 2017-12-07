@@ -43,6 +43,8 @@ public class OrchestratorRequest implements ICorfuPayload<OrchestratorRequest> {
         switch (type) {
             case ADD_NODE:
                 return new AddNodeRequest(payload);
+            case REMOVE_NODE:
+                return new RemoveNodeRequest(payload);
             case QUERY:
                 return new QueryRequest(payload);
             default:

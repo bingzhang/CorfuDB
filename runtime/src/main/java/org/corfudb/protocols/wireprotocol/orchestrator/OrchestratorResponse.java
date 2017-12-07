@@ -41,6 +41,9 @@ public class OrchestratorResponse implements ICorfuPayload<OrchestratorResponse>
                 return new QueryResponse(payload);
             case WORKFLOW_ID:
                 return new AddNodeResponse(payload);
+            case DELETE_STATUS:
+                return new RemoveNodeResponse(payload);
+
             default:
                 throw new IllegalStateException("Unknown Orchestrator Type");
         }

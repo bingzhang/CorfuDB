@@ -36,7 +36,7 @@ import static org.corfudb.format.Types.OrchestratorRequestType.ADD_NODE;
  */
 @NotThreadSafe
 @Slf4j
-public class AddNodeWorkflow implements Workflow {
+public class AddNodeWorkflow extends Workflow {
 
     final AddNodeRequest request;
 
