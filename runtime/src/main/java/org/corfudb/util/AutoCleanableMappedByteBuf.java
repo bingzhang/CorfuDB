@@ -1,8 +1,12 @@
 package org.corfudb.util;
 
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
 import java.nio.MappedByteBuffer;
 import javax.annotation.Nonnull;
+import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
+import sun.misc.Cleaner;
 import sun.nio.ch.DirectBuffer;
 
 /** {@link this} wraps around a {@link MappedByteBuffer}, implementing the
@@ -12,26 +16,23 @@ import sun.nio.ch.DirectBuffer;
  *  <p>Once the buffer is closed it should no longer be used.
  */
 @Slf4j
-public class AutoCleanableMappedBuffer implements AutoCloseable {
+public class AutoCleanableMappedByteBuf implements AutoCloseable {
 
     /** The {@link java.nio.MappedByteBuffer} being wrapped. */
-    final MappedByteBuffer buffer;
+    @Getter
+    private final MappedByteBuffer buffer;
 
-    /** Construct a new {@link org.corfudb.util.AutoCleanableMappedBuffer}.
+    /** A {@link ByteBuf} which wraps the {@link MappedByteBuffer}. */
+    @Getter
+    private final ByteBuf byteBuf;
+
+    /** Construct a new {@link AutoCleanableMappedByteBuf}.
      *
      * @param buffer    The {@link MappedByteBuffer} to wrap.
      */
-    public AutoCleanableMappedBuffer(@Nonnull MappedByteBuffer buffer) {
+    public AutoCleanableMappedByteBuf(@Nonnull MappedByteBuffer buffer) {
         this.buffer = buffer;
-    }
-
-    /** Get the underlying buffer. It is recommended that a reference NOT be saved (e.g, call
-     * {@link this#getBuffer()} each time the buffer is needed).
-     *
-     * @return The underlying {@link MappedByteBuffer}
-     */
-    public MappedByteBuffer getBuffer() {
-        return buffer;
+        this.byteBuf = Unpooled.wrappedBuffer(buffer);
     }
 
     /** {@inheritDoc}
@@ -41,9 +42,12 @@ public class AutoCleanableMappedBuffer implements AutoCloseable {
     @Override
     public void close() {
         try {
-            ((DirectBuffer) buffer).cleaner().clean();
+            Cleaner c = ((DirectBuffer) buffer).cleaner();
+            if (c != null) {
+                 c.clean();
+            }
         } catch (Exception ex) {
-            throw new UnsupportedOperationException("Failed to autoclean buffer");
+            throw new UnsupportedOperationException("Failed to autoclean buffer", ex);
         }
     }
 }
