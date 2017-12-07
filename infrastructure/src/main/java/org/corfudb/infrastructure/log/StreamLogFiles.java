@@ -451,8 +451,16 @@ public class StreamLogFiles implements StreamLog, StreamLogWithRankedAddressSpac
         writeChannels.remove(filePath);
     }
 
+    /** A functional interface which defines an action to be performed during a scan. */
     @FunctionalInterface
     interface ScanAction {
+
+        /** Consume a {@link LogEntry}.
+         *
+         * @param offset    The offset in the file the {@link LogEntry} was found at.
+         * @param metadata  The {@link Metadata} associated with at entry.
+         * @param entry     The {@link LogEntry} which was encountered.
+         */
         void consume(long offset, Metadata metadata, LogEntry entry);
     }
 
@@ -519,6 +527,8 @@ public class StreamLogFiles implements StreamLog, StreamLogWithRankedAddressSpac
                 }
                 scanAction.consume(index, logMetadata, logEntry);
             }
+        } catch (InvalidProtocolBufferException e) {
+            throw new DataCorruptionException();
         }
     }
 
